@@ -1,328 +1,250 @@
-function [Y, R, E] = Isomap(D, n_fcn, n_size, optsIn)
-% ISOMAP_CPU_FAST  Optimized CPU-only Isomap for MATLAB
+function [Y, R] = Isomap(X, opts)
+% ISOMAP  Chunked Isomap (CPU-only) for large datasets
 %
-%   [Y, R, E] = Isomap_cpu_fast(D, n_fcn, n_size, optsIn)
-%
-% This function computes an Isomap embedding of a dataset given a distance 
-% matrix D. It is aggressively optimized for CPU performance using:
-%   - Sparse adjacency matrices to store the neighborhood graph
-%   - MATLAB's graph/dijkstra routines instead of triple loops
-%   - BLAS-friendly linear algebra for MDS
-%   - Optional landmark-based approximation for very large datasets
+%   [Y, R] = Isomap(X, opts)
 %
 % INPUTS:
-%   D         : N x N symmetric, non-negative distance matrix between points
-%
-%   n_fcn     : Neighborhood function type (defines how the local graph is built)
-%               'k'       : Each point is connected to its k nearest neighbors
-%                           - Guarantees every point has k neighbors
-%                           - Good default choice for unknown data scale or 
-%                             unevenly sampled data
-%               'epsilon' : Each point is connected to all neighbors within 
-%                           distance <= epsilon
-%                           - Useful when sampling is uniform and distance scale 
-%                             is meaningful
-%               Choosing k or epsilon correctly is crucial for a connected graph.
-%
-%   n_size    : Neighborhood size parameter
-%               - If n_fcn='k', n_size = number of neighbors (integer)
-%               - If n_fcn='epsilon', n_size = distance threshold (scalar)
-%
-%   optsIn    : (Optional) structure of additional options:
-%       dims            : vector of embedding dimensions to compute (default 1:10)
-%       comp            : which connected component to embed (default 1 = largest)
-%       overlay         : flag to return adjacency matrix (0 = don't, 1 = return)
-%       verbose         : flag to print progress messages (default 1)
-%       approxLandmarks : number of landmarks for approximate Isomap 
-%                         (0 = exact Isomap, default 0)
+%   X    : N x D data matrix (observations in rows)
+%   opts : structure with fields (all optional)
+%       .n_fcn  : 'k' (default) or 'epsilon' (neighborhood function)
+%       .n_size : neighborhood parameter (k integer or epsilon scalar)
+%       .dims   : vector of requested embedding dims (default 1:10)
+%       .comp   : which connected component to embed by size rank (default 1 = largest)
+%       .verbose: 1/0 print progress (default 1)
+%       .chunk  : chunk size (rows per block) for pdist2 (default 1000)
 %
 % OUTPUTS:
-%   Y.coords : cell array of embedded coordinates, one cell per requested dimension
-%   Y.index  : indices of points in the selected connected component
-%   R        : residual variance for each embedding (smaller = better)
-%   E        : adjacency matrix of the neighborhood graph (if overlay = 1)
-%
-% NOTES ON NEIGHBORHOOD CHOICE:
-%   - 'k' nearest neighbors:
-%       Each point is guaranteed exactly k neighbors. Ensures graph connectivity 
-%       in unevenly sampled data. Typical k = 5-15 for small-to-medium datasets.
-%       Too small k → graph disconnected. Too large k → Isomap approaches PCA.
-%
-%   - 'epsilon' neighborhood:
-%       Each point connects to all neighbors within distance <= epsilon. Useful 
-%       for uniformly sampled data where local scale is known. Harder to tune.
-%
-% PERFORMANCE OPTIMIZATIONS:
-%   - Sparse adjacency reduces memory and speeds up graph operations
-%   - MATLAB's graph/dijkstra functions are multithreaded C routines
-%   - BLAS-friendly MDS avoids pdist2 and large double loops
-%   - Optional single-precision usage reduces memory and improves speed
-%   - Landmark approximation reduces complexity for very large N (O(m^3 + m*N))
-%
-% EXAMPLES:
-%   % Standard exact Isomap with 10 nearest neighbors
-%   options = struct('dims',1:5,'verbose',1);
-%   [Y,R] = Isomap_cpu_fast(D,'k',10,options);
-%
-%   % Approximate Isomap with 500 landmarks
-%   options = struct('dims',1:5,'approxLandmarks',500);
-%   [Y,R] = Isomap_cpu_fast(D,'k',10,options);
+%   Y.coords : cell array with coordinates (each cell is d x N_comp for each dims entry)
+%   R        : residual variance for each requested embedding (1 x numel(dims))
 
-
-if nargin < 3, error('Requires D, n_fcn, n_size'); end
-if size(D,1) ~= size(D,2), error('D must be square'); end
-if nargin < 4 || isempty(optsIn), optsIn = struct(); end
+if nargin < 1, error('Requires X input'); end
+if nargin < 2, opts = struct(); end
 
 % ---- defaults ----
-optsIn = setIfMissing(optsIn,'dims', 1:10);
-optsIn = setIfMissing(optsIn,'comp', 1);
-optsIn = setIfMissing(optsIn,'overlay', 0);
-optsIn = setIfMissing(optsIn,'verbose', 1);
-optsIn = setIfMissing(optsIn,'approxLandmarks', 0); % 0 = exact
-dims = optsIn.dims;
-comp = optsIn.comp;
-overlay = optsIn.overlay;
-verbose = optsIn.verbose;
-nLandmarks = optsIn.approxLandmarks;
+opts = setIfMissing(opts, 'n_fcn', 'k');
+opts = setIfMissing(opts, 'n_size', 10);
+opts = setIfMissing(opts, 'dims', 1:10);
+opts = setIfMissing(opts, 'comp', 1);
+opts = setIfMissing(opts, 'verbose', 1);
+opts = setIfMissing(opts, 'chunk', 1000);
 
-N = size(D,1);
+n_fcn = opts.n_fcn;
+n_size = opts.n_size;
+dims = opts.dims;
+comp = opts.comp;
+verbose = opts.verbose;
+chunkSize = max(1, round(opts.chunk));
+
+[N, D] = size(X);
 Y.coords = cell(length(dims),1);
-R = zeros(1,length(dims));
-INF = 1e9 * max(D(:)) * max(1,N); % large sentinel
+R = nan(1,length(dims));
 
+% ---- 1) build neighborhood sparse graph (chunked distance computation) ----
+if verbose, fprintf('Building neighborhood graph (chunked)...\n'); end
 
-% ---- 1) build neighborhood sparse graph ----
-if verbose, fprintf('Building neighborhood graph (sparse)...\n'); end
 switch lower(n_fcn)
     case 'k'
         K = n_size;
         if K ~= round(K), error('n_size must be integer for ''k'''); end
-        % Use mink for each column: faster than sorting whole matrix
-        % We ask for K+1 because diagonal/self distance may be included
-        [vals, idx] = mink(D, min(K+1, N), 1);  % Nx columns
-        % create lists for sparse
-        src = repmat(1:N, min(K+1,N), 1);
-        src = src(:); idx = idx(:); vals = vals(:);
-        % remove self-links (where idx == src)
-        keep = idx ~= src;
-        i_list = src(keep);
-        j_list = idx(keep);
-        w_list = vals(keep);
+        kq = min(K+1, N);  % include self
+        % preallocate arrays for K*N nonzero entries (upper bound)
+        estNNZ = N * K;
+        i_list = zeros(estNNZ,1,'uint32');
+        j_list = zeros(estNNZ,1,'uint32');
+        w_list = zeros(estNNZ,1,'double');
+        ptr = 1;
+        for i0 = 1:chunkSize:N
+            i1 = min(i0 + chunkSize - 1, N);
+            rows = i0:i1;
+            if verbose, fprintf('  chunk %d:%d ...\n', i0, i1); end
+            % compute distances for this block (rows x N)
+            Dblock = pdist2(single(X(rows,:)), single(X), 'euclidean'); % chunk x N, single for memory
+            % get k+1 neighbors then remove self
+            [valsBlock, idxBlock] = mink(Dblock, kq, 2);
+            % build mask to remove self-links
+            srcRows = repmat(rows', 1, kq);
+            keepMask = (idxBlock ~= srcRows);  % chunk x kq logical
+            % flatten and keep only K entries per row (after removing self)
+            % After removing self there will be exactly K entries per row when kq==K+1
+            valsRow = valsBlock(:,1:kq);
+            idxRow = idxBlock(:,1:kq);
+            % pick only columns where keepMask true
+            valsSel = valsRow(keepMask);
+            idxSel = idxRow(keepMask);
+            % source indices repeated
+            numNew = numel(idxSel);
+            if ptr + numNew - 1 > numel(i_list)
+                % grow arrays (rare): double capacity
+                newCap = max(numel(i_list)*2, ptr+numNew);
+                i_list(end+1:newCap) = uint32(0);
+                j_list(end+1:newCap) = uint32(0);
+                w_list(end+1:newCap) = 0;
+            end
+            % fill
+            % create src column matching idxSel
+            repSrc = repmat(rows', 1, K)'; % not used directly, simpler to generate:
+            % compute row indices corresponding to keepMask true
+            [rInd, cInd] = find(keepMask); % rInd: row within chunk, cInd: neighbor column
+            srcIndices = rows(rInd)';
+            i_list(ptr:ptr+numNew-1) = uint32(srcIndices(:));
+            j_list(ptr:ptr+numNew-1) = uint32(idxSel(:));
+            w_list(ptr:ptr+numNew-1) = double(valsSel(:));
+            ptr = ptr + numNew;
+            clear Dblock valsBlock idxBlock valsRow idxRow valsSel idxSel keepMask rInd cInd srcIndices
+        end
+        % trim arrays
+        i_list = double(i_list(1:ptr-1));
+        j_list = double(j_list(1:ptr-1));
+        w_list = double(w_list(1:ptr-1));
     case 'epsilon'
         epsv = n_size;
-        mask = (D <= epsv) & (D > 0); % exclude zeros on diag
-        [i_list, j_list] = find(mask);
-        w_list = D(mask);
+        % for epsilon it's hard to pre-estimate nnz; collect in cell arrays per chunk
+        i_cells = {};
+        j_cells = {};
+        w_cells = {};
+        total = 0;
+        for i0 = 1:chunkSize:N
+            i1 = min(i0 + chunkSize - 1, N);
+            rows = i0:i1;
+            if verbose, fprintf('  chunk %d:%d ...\n', i0, i1); end
+            Dblock = pdist2(single(X(rows,:)), single(X), 'euclidean'); % chunk x N
+            mask = (Dblock <= epsv) & (Dblock > 0);
+            [rInd, cInd] = find(mask);
+            if ~isempty(rInd)
+                srcIndices = rows(rInd)';
+                i_cells{end+1} = double(srcIndices(:));
+                j_cells{end+1} = double(cInd(:));
+                w_cells{end+1} = double(Dblock(mask));
+                total = total + numel(rInd);
+            end
+            clear Dblock mask rInd cInd srcIndices
+        end
+        if total == 0
+            i_list = [];
+            j_list = [];
+            w_list = [];
+        else
+            i_list = vertcat(i_cells{:});
+            j_list = vertcat(j_cells{:});
+            w_list = vertcat(w_cells{:});
+        end
     otherwise
         error('n_fcn must be ''k'' or ''epsilon''');
 end
 
-% build symmetric sparse adjacency (take min for mutual edges)
-A = sparse(i_list, j_list, double(w_list), N, N);
-A = min(A, A');  % ensure symmetry and smaller weight if asymmetric
+% If no neighbors found (degenerate), fail
+if isempty(i_list)
+    error('No neighbors found — check n_size or data.');
+end
 
-% keep only finite, positive weights (filter out inf/zeros)
-[iw, jw, vw] = find(A);               % row, col, value vectors
-keep = (vw > 0) & isfinite(vw);       % logical mask for valid edges
+% build sparse adjacency and symmetrize
+A = sparse(i_list, j_list, double(w_list), N, N);
+A = min(A, A'); % enforce symmetry and choose smaller weight
+[iw, jw, vw] = find(A);
+keep = (vw > 0) & isfinite(vw);
 A = sparse(iw(keep), jw(keep), vw(keep), N, N);
 
-
-if overlay
-    E = (A ~= 0); % adjacency for overlay
-else
-    E = [];
-end
-
-% ---- 2) compute shortest-path geodesic distances using graph/dijkstra ----
+% ---- 2) shortest-path geodesic distances ----
 if verbose, fprintf('Computing all-pairs shortest paths using graph distances...\n'); end
 G = graph(A);
-% distances uses optimized C implementation (Dijkstra / Johnson as needed)
-% If approxLandmarks > 0, we will compute landmark distances only (see later).
-if nLandmarks <= 0
-    % full all-pairs distances
-    Dgeo = distances(G); % returns double
-else
-    % approximate mode: compute distances from landmarks only
-    nLand = min(nLandmarks, N);
-    if verbose, fprintf('Using %d landmarks for approximate Isomap\n', nLand); end
-    rng(0); % reproducible
-    landmarks = randperm(N, nLand);
-    % distances from landmarks to all nodes (matrix nLand x N)
-    Dland = distances(G, landmarks); % each column -> distances from node to landmarks (note order)
-    % We'll embed landmarks and extend others (landmark Isomap).
-    % Build Dgeo as [] to mark approximate mode
-    Dgeo = [];
-end
+Dgeo_full = distances(G);
 
-% ---- 3) connected components: use conncomp on graph G ----
-if verbose, fprintf('Extracting largest connected components...\n'); end
-compLabels = conncomp(G); % 1..numComp labels
-% choose component by comp option: rank by size
+% large sentinel for unreachable pairs (use max observed finite distance)
+finiteWeights = vw(isfinite(vw) & vw>0);
+if isempty(finiteWeights)
+    maxW = 1;
+else
+    maxW = max(finiteWeights);
+end
+INF = 1e9 * maxW * max(1,N);
+
+% ---- 3) connected components ----
+if verbose, fprintf('Extracting connected components...\n'); end
+compLabels = conncomp(G);
 tab = histcounts(compLabels, 1:max(compLabels)+1);
 [~, orderIdx] = sort(tab, 'descend');
 orderIdx = orderIdx(:);
 if comp > numel(orderIdx), comp = 1; end
 selLabel = orderIdx(comp);
 sel = find(compLabels == selLabel);
-Y.index = sel;
-% If we used landmarks approximate and some landmarks not in component, filter them later
-% Restrict graph / distance to selected nodes
-if nLandmarks <= 0
-    Dgeo = Dgeo(sel, sel);
-else
-    % filter distance maps for selected nodes
-    % Keep only landmarks that are inside the selected component
-    % (if none inside, fallback to exact on component)
-    landIn = intersect(landmarks, sel);
-    if isempty(landIn)
-        warning('No landmarks within selected component - falling back to exact distances');
-        Dgeo = distances(G, sel);
-    else
-        % distances from landIn to sel
-        Dland_sel = distances(G, landIn, sel);
-        Dgeo = []; % keep special path for landmarks
-        landmarks = landIn;
-        Dland = Dland_sel;
-        nLand = numel(landmarks);
-    end
-end
+Y.index = sel; % indices in original data
 
-% update N to component size
+% restrict geodesic distance to component
+Dgeo = Dgeo_full(sel, sel);
 Ncomp = numel(sel);
 
-% ---- 4) classical MDS on Dgeo (exact) or Landmark MDS (approx) ----
-if nLandmarks <= 0
-    if verbose, fprintf('Performing Classical MDS (exact) on %d points...\n', Ncomp); end
-    % ensure Dgeo is finite: unreachable pairs -> INF
-    unreachable = ~isfinite(Dgeo) | (Dgeo > 0.5*INF);
-    if any(unreachable(:))
-        Dgeo(unreachable) = INF;
-    end
-    % squared-distance double
-    D2 = (Dgeo).^2;
-    % double centering using vectorized ops
-    m1 = mean(D2,2); m2 = mean(D2,1); M = mean(D2(:));
-    H = -0.5 * (D2 - m1 - m2 + M);
-    kmax = max(dims);
-    opts.eigs.tol = 1e-6;
-    opts.eigs.maxit = 500;
-    % if Ncomp is small, use full eig
-    if Ncomp <= 2000
+% ---- 4) classical MDS ----
+if verbose, fprintf('Performing classical MDS on %d points...\n', Ncomp); end
+% handle unreachable pairs
+unreachable = ~isfinite(Dgeo) | (Dgeo > 0.5*INF);
+if any(unreachable(:))
+    Dgeo(unreachable) = INF;
+end
+D2 = (Dgeo).^2;
+% double-centering
+m1 = mean(D2,2); m2 = mean(D2,1); M = mean(D2(:));
+H = -0.5 * (D2 - m1 - m2 + M);
+
+kmax = max(dims);
+opts_eigs.tol = 1e-6; opts_eigs.maxit = 500;
+if Ncomp <= 2000
+    [Vfull, Lfull] = eig(H);
+    [lamAll, ord] = sort(real(diag(Lfull)),'descend');
+    Vfull = Vfull(:, ord);
+    V = Vfull(:, 1:min(kmax, Ncomp));
+    lam = lamAll(1:min(kmax, Ncomp));
+else
+    try
+        [V, L] = eigs(H, min(kmax, Ncomp-1), 'la', opts_eigs);
+        [lam, order] = sort(real(diag(L)),'descend');
+        V = V(:, order);
+    catch
+        warning('eigs failed, falling back to full eig');
         [Vfull, Lfull] = eig(H);
         [lamAll, ord] = sort(real(diag(Lfull)),'descend');
         Vfull = Vfull(:, ord);
         V = Vfull(:, 1:min(kmax, Ncomp));
         lam = lamAll(1:min(kmax, Ncomp));
-    else
-        % use eigs for top kmax components (Lanczos)
-        try
-            [V, L] = eigs(H, min(kmax, Ncomp-1), 'la', opts.eigs);
-            [lam, order] = sort(real(diag(L)),'descend');
-            V = V(:, order);
-        catch ME
-            warning('eigs failed, falling back to full eig: %s', ME.message);
-            [Vfull, Lfull] = eig(H);
-            [lamAll, ord] = sort(real(diag(Lfull)),'descend');
-            Vfull = Vfull(:, ord);
-            V = Vfull(:, 1:min(kmax, Ncomp));
-            lam = lamAll(1:min(kmax, Ncomp));
-        end
     end
+end
 
-    % compute coords and residuals
-    Dvec = Dgeo(:);
-    for ii = 1:length(dims)
-        d = dims(ii);
-        if d <= Ncomp
-            coords = (V(:,1:d) .* sqrt(lam(1:d)'))';
-            Y.coords{ii} = coords;
-            % compute pairwise distances quicker via Gram-based formula
-            X = coords'; % Ncomp x d
-            sq = sum(X.^2,2);
-            % squared distances matrix via BLAS-friendly ops
-            Gdist2 = bsxfun(@plus, sq, sq') - 2*(X*X');
-            Gdist2(Gdist2 < 0) = 0;
-            embD = sqrt(Gdist2);
-            C = corrcoef(embD(:), Dvec);
-            R(ii) = 1 - C(2,1)^2;
-            if verbose, fprintf('Embedding %d dims: residual variance = %.6f\n', d, R(ii)); end
-        else
-            Y.coords{ii} = [];
-            R(ii) = NaN;
-        end
-    end
+% clip tiny negatives due to numerical noise
+lam(lam < 0) = 0;
 
-else
-    % ---- Landmark approximate Isomap (fast) ----
-    if verbose, fprintf('Running Landmark Isomap (approx) with %d landmarks...\n', numel(landmarks)); end
-    % Dland : distances from landmarks to ALL nodes (should be nLand x Ncomp)
-    % Build pairwise landmark distances (nLand x nLand)
-    Dll = Dland(:, sel)'; % careful with orientation: ensure Dll(i,j) is dist landmark_i to landmark_j
-    Dll = Dll(ismember(sel, landmarks), :); % ensure correct order (left as caution)
-    Dll = distances(G, landmarks); % simpler: distances between landmarks
-    Dll = Dll(:,ismember(landmarks, sel)); % ensure selection
-    Dll = Dll(:,:);
-    % classical MDS on landmarks
-    D2L = (Dll).^2;
-    m1 = mean(D2L,2); m2 = mean(D2L,1); M = mean(D2L(:));
-    H_L = -0.5 * (D2L - m1 - m2 + M);
-    kmax = max(dims);
-    [VL, LL] = eigs(H_L, min(kmax, size(H_L,1)-1), 'la');
-    [lamL, ordL] = sort(real(diag(LL)),'descend');
-    VL = VL(:, ordL);
-    % coords of landmarks
-    coordsL = (VL(:,1:kmax) .* sqrt(lamL(1:kmax)'))';
-    % Nystrom extension (brief / approximate)
-    % X_non = ( -0.5 * (d_n^2 - mean_col(Dll.^2) - mean_row(Dll.^2) + mean_all) ) * VL * inv(Lambda)
-    % We'll compute extension for each requested dim below.
-    % Precompute kernel for extension:
-    muL_row = mean(D2L,2);
-    muL_all = mean(D2L(:));
-    % distances from non-landmarks to landmarks:
-    Dnl = (Dland(:, sel)'); % Ncomp x nLand (maybe)
-    Dnl2 = Dnl.^2;
-    for ii = 1:length(dims)
-        d = dims(ii);
-        if d > size(VL,1), Y.coords{ii} = []; R(ii)=NaN; continue; end
-        VLd = VL(:, 1:d);
-        Lamd = diag(lamL(1:d));
-        % compute B_n = -0.5*(Dnl2 - repmat(muL_row',Ncomp,1) - repmat(mean(Dnl2,2),1,nLand) + muL_all)
-        mu_col = mean(Dnl2,1);
-        mu_row_all = mean(Dnl2,2);
-        Bn = -0.5*( Dnl2 - repmat(muL_row', Ncomp, 1) - repmat(mu_row_all, 1, numel(muL_row)) + muL_all );
-        % extension coords:
-        Xn = (Bn * VLd) / Lamd; % Ncomp x d
-        coords = [coordsL(1:d,:)'; Xn]; % landmarks first then others; we'll only select sel ordering
-        % But user expects coords per point in component order; reassemble:
-        % landmarks are a subset; build final coords matrix in sel order:
-        coordsFinal = zeros(d, Ncomp);
-        % map landmarks positions
-        [~, locInSel] = ismember(landmarks, sel);
-        coordsFinal(:, locInSel) = coordsL(1:d, :)';
-        % fill non-landmarks
-        nonLandIdx = setdiff(1:Ncomp, locInSel);
-        coordsFinal(:, nonLandIdx) = Xn(nonLandIdx, :)';
-        Y.coords{ii} = coordsFinal;
-        % residuals: compute emb pairwise distances via Gram method
-        X = coordsFinal'; sq = sum(X.^2,2);
-        Gdist2 = bsxfun(@plus, sq, sq') - 2*(X*X');
-        Gdist2(Gdist2<0) = 0;
+% prepare original geodesic vector for residual correlation
+Dgeo_vec = Dgeo(:);
+
+for ii = 1:length(dims)
+    d = dims(ii);
+    if d <= Ncomp
+        % coordinates: d x Ncomp (rows: axes)
+        Lam_d = sqrt(lam(1:d));
+        coords = (V(:,1:d) .* Lam_d')';
+        Y.coords{ii} = coords;
+        % compute pairwise distances from coords
+        Xc = coords'; % Ncomp x d
+        sq = sum(Xc.^2,2);
+        Gdist2 = bsxfun(@plus, sq, sq') - 2*(Xc*Xc');
+        Gdist2(Gdist2 < 0) = 0;
         embD = sqrt(Gdist2);
-        % we need original geodesic distances for selected nodes:
-        Dvec = (distances(G, sel));
-        Dvec = Dvec(:);
-        C = corrcoef(embD(:), Dvec);
-        R(ii) = 1 - C(2,1)^2;
-        if verbose, fprintf('Approx embedding %d dims (landmark): residual variance = %.6f\n', d, R(ii)); end
+        % correlation-based residual variance
+        C = corrcoef(embD(:), Dgeo_vec);
+        if numel(C) < 4 || any(isnan(C(:)))
+            R(ii) = NaN;
+        else
+            R(ii) = 1 - C(2,1)^2;
+        end
+        if verbose, fprintf('Embedding %d dims: residual variance = %.6f\n', d, R(ii)); end
+    else
+        Y.coords{ii} = [];
+        R(ii) = NaN;
     end
 end
 
-% done
-if verbose, fprintf('Isomap (CPU) finished.\n'); end
-
+if verbose, fprintf('Isomap finished.\n'); end
 end
 
-%% small helper
+%% helper
 function s = setIfMissing(s, name, val)
     if ~isfield(s, name) || isempty(s.(name))
         s.(name) = val;
